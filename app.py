@@ -1,10 +1,10 @@
-import streamlit as st
-import pandas as pd
+import html
 import sqlite3
 from datetime import date, datetime
+import pandas as pd
+import streamlit as st
 
-# ─── CONFIG ──────────────────────────────────────────────────────────────────
-
+# ─── CONFIGURAÇÃO DA PÁGINA ──────────────────────────────────────────────────
 st.set_page_config(
     page_title="TaskFlow",
     layout="wide",
@@ -12,8 +12,7 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-# ─── CUSTOM CSS ──────────────────────────────────────────────────────────────
-
+# ─── ESTILOS CSS CUSTOMIZADOS ────────────────────────────────────────────────
 st.markdown("""
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Syne:wght@400;600;700;800&family=DM+Sans:wght@300;400;500&display=swap');
@@ -156,7 +155,7 @@ input:focus, textarea:focus {
     transition: border-color 0.2s ease;
 }
 .task-card:hover { border-color: #5b5bf6; }
-.task-name { font-weight: 500; font-size: 0.95rem; }
+.task-name { font-weight: 500; font-size: 0.95rem; word-break: break-word; }
 .task-date { font-size: 0.78rem; color: #6b6a65; margin-top: 3px; }
 
 /* ── Divider ── */
@@ -164,12 +163,6 @@ hr { border-color: #222228; }
 
 /* ── Alerts ── */
 .stAlert { border-radius: 10px !important; }
-
-/* ── Selectbox ── */
-[data-baseweb="select"] > div {
-    background: #1a1a1f !important;
-    border-color: #2a2a32 !important;
-}
 
 /* ── Priority tag ── */
 .priority-alta   { color: #e05c5c; font-size: 0.72rem; font-weight: 700; }
@@ -198,11 +191,13 @@ hr { border-color: #222228; }
 """, unsafe_allow_html=True)
 
 # ─── DATABASE ────────────────────────────────────────────────────────────────
+DB_PATH = "tasks.db"
 
-DB = "tasks.db"
-
-def get_conn():
-    return sqlite3.connect(DB)
+def get_conn() -> sqlite3.Connection:
+    conn = sqlite3.connect(DB_PATH, timeout=10.0)
+    conn.execute("PRAGMA journal_mode=WAL;")
+    conn.execute("PRAGMA synchronous=NORMAL;")
+    return conn
 
 def init_db():
     with get_conn() as conn:
@@ -218,7 +213,6 @@ def init_db():
                 created_at TEXT   DEFAULT (datetime('now'))
             )
         ''')
-        # migrate: add columns if missing (for existing DBs)
         for col, definition in [
             ("priority",   "TEXT NOT NULL DEFAULT 'Média'"),
             ("category",   "TEXT DEFAULT ''"),
@@ -239,28 +233,9 @@ def get_tasks() -> pd.DataFrame:
         )
     return df
 
-def add_task(name: str, status: str, priority: str, category: str, due_date: str, notes: str):
-    with get_conn() as conn:
-        conn.execute(
-            "INSERT INTO tasks (task_name, status, priority, category, due_date, notes) VALUES (?, ?, ?, ?, ?, ?)",
-            (name, status, priority, category, due_date, notes)
-        )
-    get_tasks.clear()
-
-def delete_task(task_id: int):
-    with get_conn() as conn:
-        conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
-    get_tasks.clear()
-
-def update_task(task_id: int, status: str, priority: str, notes: str):
-    with get_conn() as conn:
-        conn.execute(
-            "UPDATE tasks SET status = ?, priority = ?, notes = ? WHERE id = ?",
-            (status, priority, notes, task_id)
-        )
-    get_tasks.clear()
-
-# ─── HELPERS ─────────────────────────────────────────────────────────────────
+# ─── CONSTANTES & SEGURANÇA ──────────────────────────────────────────────────
+MAX_NAME_LEN = 150
+MAX_NOTES_LEN = 1000
 
 STATUSES    = ["Pendente", "Em Progresso", "Concluído"]
 PRIORITIES  = ["Alta", "Média", "Baixa"]
@@ -270,8 +245,45 @@ STATUS_EMOJI    = {"Pendente": "⏳", "Em Progresso": "🔄", "Concluído": "✅
 PRIORITY_COLOR  = {"Alta": "priority-alta", "Média": "priority-media", "Baixa": "priority-baixa"}
 STATUS_CLASS    = {"Pendente": "badge-pendente", "Em Progresso": "badge-progresso", "Concluído": "badge-concluido"}
 
+def sanitize_text(text: str) -> str:
+    """Escapa entidades HTML para mitigar Stored XSS."""
+    return html.escape(str(text or "").strip(), quote=True)
+
 def badge(text: str, css_class: str) -> str:
     return f'<span class="badge {css_class}">{text}</span>'
+
+def add_task(name: str, status: str, priority: str, category: str, due_date: str, notes: str):
+    if not name or len(name) > MAX_NAME_LEN:
+        raise ValueError(f"O nome da tarefa deve ter até {MAX_NAME_LEN} caracteres.")
+    if status not in STATUSES or priority not in PRIORITIES:
+        raise ValueError("Status ou prioridade inválidos.")
+    if len(notes) > MAX_NOTES_LEN:
+        raise ValueError(f"Notas não podem exceder {MAX_NOTES_LEN} caracteres.")
+
+    with get_conn() as conn:
+        conn.execute(
+            "INSERT INTO tasks (task_name, status, priority, category, due_date, notes) VALUES (?, ?, ?, ?, ?, ?)",
+            (name, status, priority, category, due_date, notes)
+        )
+    get_tasks.clear()
+
+def delete_task(task_id: int):
+    with get_conn() as conn:
+        conn.execute("DELETE FROM tasks WHERE id = ?", (int(task_id),))
+    get_tasks.clear()
+
+def update_task(task_id: int, status: str, priority: str, notes: str):
+    if status not in STATUSES or priority not in PRIORITIES:
+        raise ValueError("Status ou prioridade inválidos.")
+    if len(notes) > MAX_NOTES_LEN:
+        raise ValueError("Notas excedem o tamanho máximo permitido.")
+
+    with get_conn() as conn:
+        conn.execute(
+            "UPDATE tasks SET status = ?, priority = ?, notes = ? WHERE id = ?",
+            (status, priority, notes, int(task_id))
+        )
+    get_tasks.clear()
 
 def days_until(due_date_str: str) -> str:
     if not due_date_str:
@@ -288,14 +300,13 @@ def days_until(due_date_str: str) -> str:
         return ""
 
 # ─── SIDEBAR ─────────────────────────────────────────────────────────────────
-
 def render_sidebar():
     with st.sidebar:
         st.markdown("## ⚡ TaskFlow")
         st.markdown("---")
         st.markdown("### Adicionar Tarefa")
 
-        task_name = st.text_input("Nome", placeholder="Ex: Revisar relatório")
+        task_name = st.text_input("Nome", max_chars=MAX_NAME_LEN, placeholder="Ex: Revisar relatório")
         col1, col2 = st.columns(2)
         with col1:
             status = st.selectbox("Status", STATUSES)
@@ -304,13 +315,17 @@ def render_sidebar():
 
         category = st.selectbox("Categoria", CATEGORIES)
         due_date = st.date_input("Data de Entrega", min_value=date.today())
-        notes    = st.text_area("Notas", placeholder="Observações opcionais...", height=80)
+        notes    = st.text_area("Notas", max_chars=MAX_NOTES_LEN, placeholder="Observações opcionais...", height=80)
 
         if st.button("💾 Salvar Tarefa"):
-            if task_name.strip():
-                add_task(task_name.strip(), status, priority, category, str(due_date), notes)
-                st.success("Tarefa adicionada!")
-                st.rerun()
+            clean_name = task_name.strip()
+            if clean_name:
+                try:
+                    add_task(clean_name, status, priority, category, str(due_date), notes.strip())
+                    st.success("Tarefa adicionada!")
+                    st.rerun()
+                except ValueError as err:
+                    st.error(str(err))
             else:
                 st.error("Digite um nome para a tarefa.")
 
@@ -318,12 +333,11 @@ def render_sidebar():
         st.markdown("### Filtros")
         filter_status   = st.multiselect("Status", STATUSES, default=STATUSES)
         filter_priority = st.multiselect("Prioridade", PRIORITIES, default=PRIORITIES)
-        search_term     = st.text_input("🔍 Buscar", placeholder="Nome ou categoria...")
+        search_term     = st.text_input("🔍 Buscar", max_chars=100, placeholder="Nome ou categoria...")
 
     return filter_status, filter_priority, search_term
 
 # ─── MAIN ─────────────────────────────────────────────────────────────────────
-
 def main():
     init_db()
 
@@ -352,16 +366,17 @@ def main():
         st.info("📭 Nenhuma tarefa ainda. Use o menu lateral para adicionar!")
         return
 
-    # ── Filters ──────────────────────────────────────────────────────────────
+    # ── Filters (regex=False para evitar ReDoS e quebras de regex) ───────────
     df_view = df.copy()
     if filter_status:
         df_view = df_view[df_view["status"].isin(filter_status)]
     if filter_priority:
         df_view = df_view[df_view["priority"].isin(filter_priority)]
-    if search_term:
+    if search_term.strip():
+        term = search_term.strip()
         mask = (
-            df_view["task_name"].str.contains(search_term, case=False, na=False) |
-            df_view["category"].str.contains(search_term, case=False, na=False)
+            df_view["task_name"].str.contains(term, case=False, na=False, regex=False) |
+            df_view["category"].str.contains(term, case=False, na=False, regex=False)
         )
         df_view = df_view[mask]
 
@@ -373,21 +388,29 @@ def main():
             st.warning("Nenhuma tarefa corresponde aos filtros selecionados.")
         else:
             for _, row in df_view.iterrows():
+                # Sanitização rigorosa contra XSS
+                safe_name = sanitize_text(str(row["task_name"]))
+                safe_cat = sanitize_text(str(row["category"])) if row["category"] else ""
+                cat_text = f" · {safe_cat}" if safe_cat else ""
+
+                status_val = row["status"] if row["status"] in STATUSES else "Pendente"
+                prio_val = row["priority"] if row["priority"] in PRIORITIES else "Média"
+
+                status_badge = badge(f"{STATUS_EMOJI.get(status_val, '')} {status_val}", STATUS_CLASS.get(status_val, 'badge-pendente'))
+                priority_class = PRIORITY_COLOR.get(prio_val, 'priority-media')
+                
+                deadline_raw = days_until(row["due_date"])
+                deadline_disp = f" · {sanitize_text(deadline_raw)}" if deadline_raw else ""
+
                 with st.container():
                     col_info, col_actions = st.columns([5, 1])
                     with col_info:
-                        status_badge   = badge(f"{STATUS_EMOJI.get(row['status'], '')} {row['status']}", STATUS_CLASS.get(row['status'], ''))
-                        priority_class = PRIORITY_COLOR.get(row['priority'], '')
-                        cat_text       = f" · {row['category']}" if row['category'] else ""
-                        deadline_text  = days_until(row['due_date'])
-                        deadline_disp  = f" · {deadline_text}" if deadline_text else ""
-
                         st.markdown(f"""
                         <div class="task-card">
                             <div>
-                                <div class="task-name">{row['task_name']}</div>
+                                <div class="task-name">{safe_name}</div>
                                 <div class="task-date">
-                                    <span class="{priority_class}">▲ {row['priority']}</span>
+                                    <span class="{priority_class}">▲ {prio_val}</span>
                                     {cat_text}{deadline_disp}
                                 </div>
                             </div>
@@ -397,13 +420,18 @@ def main():
 
                     with col_actions:
                         with st.expander("✏️"):
-                            new_status   = st.selectbox("Status",    STATUSES,   index=STATUSES.index(row['status']),   key=f"s_{row['id']}")
-                            new_priority = st.selectbox("Prioridade", PRIORITIES, index=PRIORITIES.index(row['priority']), key=f"p_{row['id']}")
-                            new_notes    = st.text_area("Notas", value=row['notes'] or "", key=f"n_{row['id']}", height=60)
+                            s_idx = STATUSES.index(status_val) if status_val in STATUSES else 0
+                            p_idx = PRIORITIES.index(prio_val) if prio_val in PRIORITIES else 0
+                            new_status   = st.selectbox("Status",    STATUSES,   index=s_idx, key=f"s_{row['id']}")
+                            new_priority = st.selectbox("Prioridade", PRIORITIES, index=p_idx, key=f"p_{row['id']}")
+                            new_notes    = st.text_area("Notas", value=row['notes'] or "", max_chars=MAX_NOTES_LEN, key=f"n_{row['id']}", height=60)
                             if st.button("Salvar", key=f"upd_{row['id']}"):
-                                update_task(row['id'], new_status, new_priority, new_notes)
-                                st.success("Atualizado!")
-                                st.rerun()
+                                try:
+                                    update_task(row['id'], new_status, new_priority, new_notes.strip())
+                                    st.success("Atualizado!")
+                                    st.rerun()
+                                except ValueError as err:
+                                    st.error(str(err))
                             if st.button("🗑️ Deletar", key=f"del_{row['id']}"):
                                 delete_task(row['id'])
                                 st.rerun()
@@ -445,7 +473,6 @@ def main():
                 st.error(f"⚠️ {overdue} tarefa(s) com prazo vencido!")
             else:
                 st.success("✅ Nenhuma tarefa atrasada!")
-
 
 if __name__ == "__main__":
     main()
