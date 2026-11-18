@@ -1,4 +1,7 @@
+import hashlib
+import hmac
 import html
+import os
 import sqlite3
 from datetime import date, datetime
 import pandas as pd
@@ -202,6 +205,14 @@ def get_conn() -> sqlite3.Connection:
 def init_db():
     with get_conn() as conn:
         conn.execute('''
+            CREATE TABLE IF NOT EXISTS users (
+                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                username      TEXT    UNIQUE NOT NULL,
+                password_hash TEXT    NOT NULL,
+                created_at    TEXT    DEFAULT (datetime('now'))
+            )
+        ''')
+        conn.execute('''
             CREATE TABLE IF NOT EXISTS tasks (
                 id        INTEGER PRIMARY KEY AUTOINCREMENT,
                 task_name TEXT    NOT NULL,
@@ -210,32 +221,41 @@ def init_db():
                 category  TEXT             DEFAULT '',
                 due_date  TEXT,
                 notes     TEXT             DEFAULT '',
-                created_at TEXT   DEFAULT (datetime('now'))
+                created_at TEXT   DEFAULT (datetime('now')),
+                user_id   INTEGER
             )
         ''')
+        # Migração para bancos antigos
         for col, definition in [
             ("priority",   "TEXT NOT NULL DEFAULT 'Média'"),
             ("category",   "TEXT DEFAULT ''"),
             ("notes",      "TEXT DEFAULT ''"),
             ("created_at", "TEXT DEFAULT (datetime('now'))"),
+            ("user_id",    "INTEGER"),
         ]:
             try:
                 conn.execute(f"ALTER TABLE tasks ADD COLUMN {col} {definition}")
             except Exception:
                 pass
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_tasks_user ON tasks(user_id)")
 
 @st.cache_data(ttl=0)
-def get_tasks() -> pd.DataFrame:
+def get_tasks(user_id: int) -> pd.DataFrame:
     with get_conn() as conn:
         df = pd.read_sql_query(
-            "SELECT id, task_name, status, priority, category, due_date, notes, created_at FROM tasks ORDER BY id DESC",
-            conn
+            "SELECT id, task_name, status, priority, category, due_date, notes, created_at "
+            "FROM tasks WHERE user_id = ? ORDER BY id DESC",
+            conn,
+            params=(int(user_id),),
         )
     return df
 
 # ─── CONSTANTES & SEGURANÇA ──────────────────────────────────────────────────
 MAX_NAME_LEN = 150
 MAX_NOTES_LEN = 1000
+MIN_USER_LEN = 3
+MAX_USER_LEN = 30
+MIN_PASS_LEN = 6
 
 STATUSES    = ["Pendente", "Em Progresso", "Concluído"]
 PRIORITIES  = ["Alta", "Média", "Baixa"]
@@ -252,7 +272,92 @@ def sanitize_text(text: str) -> str:
 def badge(text: str, css_class: str) -> str:
     return f'<span class="badge {css_class}">{text}</span>'
 
-def add_task(name: str, status: str, priority: str, category: str, due_date: str, notes: str):
+# ─── AUTENTICAÇÃO ────────────────────────────────────────────────────────────
+def hash_password(password: str) -> str:
+    salt = os.urandom(16)
+    h = hashlib.scrypt(password.encode(), salt=salt, n=2**14, r=8, p=1)
+    return f"{salt.hex()}:{h.hex()}"
+
+def verify_password(password: str, stored: str) -> bool:
+    try:
+        salt_hex, h_hex = stored.split(":")
+        h = hashlib.scrypt(password.encode(), salt=bytes.fromhex(salt_hex), n=2**14, r=8, p=1)
+        return hmac.compare_digest(h.hex(), h_hex)
+    except Exception:
+        return False
+
+def create_user(username: str, password: str) -> int:
+    username = username.strip().lower()
+    if not (MIN_USER_LEN <= len(username) <= MAX_USER_LEN):
+        raise ValueError(f"Usuário deve ter entre {MIN_USER_LEN} e {MAX_USER_LEN} caracteres.")
+    if not username.replace("_", "").replace(".", "").isalnum():
+        raise ValueError("Usuário só pode ter letras, números, _ e .")
+    if len(password) < MIN_PASS_LEN:
+        raise ValueError(f"A senha deve ter pelo menos {MIN_PASS_LEN} caracteres.")
+
+    with get_conn() as conn:
+        is_first = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0] == 0
+        try:
+            cur = conn.execute(
+                "INSERT INTO users (username, password_hash) VALUES (?, ?)",
+                (username, hash_password(password)),
+            )
+        except sqlite3.IntegrityError:
+            raise ValueError("Esse usuário já existe.")
+        uid = cur.lastrowid
+        if is_first:
+            # A primeira conta criada herda as tarefas antigas (sem dono)
+            conn.execute("UPDATE tasks SET user_id = ? WHERE user_id IS NULL", (uid,))
+    return uid
+
+def authenticate(username: str, password: str):
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT id, password_hash FROM users WHERE username = ?",
+            (username.strip().lower(),),
+        ).fetchone()
+    if row and verify_password(password, row[1]):
+        return row[0]
+    return None
+
+def login_session(uid: int, username: str):
+    st.session_state.user_id = uid
+    st.session_state.username = username.strip().lower()
+
+def render_auth():
+    _, center, _ = st.columns([1, 1.2, 1])
+    with center:
+        st.markdown("## ⚡ TaskFlow")
+        tab_in, tab_up = st.tabs(["Entrar", "Criar conta"])
+
+        with tab_in:
+            u = st.text_input("Usuário", key="login_u", max_chars=MAX_USER_LEN)
+            p = st.text_input("Senha", type="password", key="login_p")
+            if st.button("Entrar", key="btn_login"):
+                uid = authenticate(u, p)
+                if uid:
+                    login_session(uid, u)
+                    st.rerun()
+                else:
+                    st.error("Usuário ou senha incorretos.")
+
+        with tab_up:
+            u = st.text_input("Usuário", key="reg_u", max_chars=MAX_USER_LEN)
+            p = st.text_input("Senha", type="password", key="reg_p")
+            p2 = st.text_input("Confirmar senha", type="password", key="reg_p2")
+            if st.button("Criar conta", key="btn_register"):
+                if p != p2:
+                    st.error("As senhas não conferem.")
+                else:
+                    try:
+                        uid = create_user(u, p)
+                        login_session(uid, u)
+                        st.rerun()
+                    except ValueError as err:
+                        st.error(str(err))
+
+# ─── OPERAÇÕES DE TAREFAS (sempre filtradas pelo dono) ───────────────────────
+def add_task(user_id: int, name: str, status: str, priority: str, category: str, due_date: str, notes: str):
     if not name or len(name) > MAX_NAME_LEN:
         raise ValueError(f"O nome da tarefa deve ter até {MAX_NAME_LEN} caracteres.")
     if status not in STATUSES or priority not in PRIORITIES:
@@ -262,17 +367,21 @@ def add_task(name: str, status: str, priority: str, category: str, due_date: str
 
     with get_conn() as conn:
         conn.execute(
-            "INSERT INTO tasks (task_name, status, priority, category, due_date, notes) VALUES (?, ?, ?, ?, ?, ?)",
-            (name, status, priority, category, due_date, notes)
+            "INSERT INTO tasks (user_id, task_name, status, priority, category, due_date, notes) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (int(user_id), name, status, priority, category, due_date, notes)
         )
     get_tasks.clear()
 
-def delete_task(task_id: int):
+def delete_task(task_id: int, user_id: int):
     with get_conn() as conn:
-        conn.execute("DELETE FROM tasks WHERE id = ?", (int(task_id),))
+        conn.execute(
+            "DELETE FROM tasks WHERE id = ? AND user_id = ?",
+            (int(task_id), int(user_id))
+        )
     get_tasks.clear()
 
-def update_task(task_id: int, status: str, priority: str, notes: str):
+def update_task(task_id: int, user_id: int, status: str, priority: str, notes: str):
     if status not in STATUSES or priority not in PRIORITIES:
         raise ValueError("Status ou prioridade inválidos.")
     if len(notes) > MAX_NOTES_LEN:
@@ -280,8 +389,8 @@ def update_task(task_id: int, status: str, priority: str, notes: str):
 
     with get_conn() as conn:
         conn.execute(
-            "UPDATE tasks SET status = ?, priority = ?, notes = ? WHERE id = ?",
-            (status, priority, notes, int(task_id))
+            "UPDATE tasks SET status = ?, priority = ?, notes = ? WHERE id = ? AND user_id = ?",
+            (status, priority, notes, int(task_id), int(user_id))
         )
     get_tasks.clear()
 
@@ -300,9 +409,14 @@ def days_until(due_date_str: str) -> str:
         return ""
 
 # ─── SIDEBAR ─────────────────────────────────────────────────────────────────
-def render_sidebar():
+def render_sidebar(uid: int):
     with st.sidebar:
         st.markdown("## ⚡ TaskFlow")
+        st.caption(f"👤 {st.session_state.username}")
+        if st.button("🚪 Sair", key="btn_logout"):
+            st.session_state.clear()
+            st.rerun()
+
         st.markdown("---")
         st.markdown("### Adicionar Tarefa")
 
@@ -321,7 +435,7 @@ def render_sidebar():
             clean_name = task_name.strip()
             if clean_name:
                 try:
-                    add_task(clean_name, status, priority, category, str(due_date), notes.strip())
+                    add_task(uid, clean_name, status, priority, category, str(due_date), notes.strip())
                     st.success("Tarefa adicionada!")
                     st.rerun()
                 except ValueError as err:
@@ -341,7 +455,13 @@ def render_sidebar():
 def main():
     init_db()
 
-    filter_status, filter_priority, search_term = render_sidebar()
+    # Sem login → mostra só a tela de autenticação
+    if "user_id" not in st.session_state:
+        render_auth()
+        return
+
+    uid = st.session_state.user_id
+    filter_status, filter_priority, search_term = render_sidebar(uid)
 
     # Header
     st.markdown("""
@@ -351,7 +471,7 @@ def main():
         </div>
     """, unsafe_allow_html=True)
 
-    df = get_tasks()
+    df = get_tasks(uid)
 
     # ── Metrics ──────────────────────────────────────────────────────────────
     c1, c2, c3, c4 = st.columns(4)
@@ -398,7 +518,7 @@ def main():
 
                 status_badge = badge(f"{STATUS_EMOJI.get(status_val, '')} {status_val}", STATUS_CLASS.get(status_val, 'badge-pendente'))
                 priority_class = PRIORITY_COLOR.get(prio_val, 'priority-media')
-                
+
                 deadline_raw = days_until(row["due_date"])
                 deadline_disp = f" · {sanitize_text(deadline_raw)}" if deadline_raw else ""
 
@@ -427,13 +547,13 @@ def main():
                             new_notes    = st.text_area("Notas", value=row['notes'] or "", max_chars=MAX_NOTES_LEN, key=f"n_{row['id']}", height=60)
                             if st.button("Salvar", key=f"upd_{row['id']}"):
                                 try:
-                                    update_task(row['id'], new_status, new_priority, new_notes.strip())
+                                    update_task(row['id'], uid, new_status, new_priority, new_notes.strip())
                                     st.success("Atualizado!")
                                     st.rerun()
                                 except ValueError as err:
                                     st.error(str(err))
                             if st.button("🗑️ Deletar", key=f"del_{row['id']}"):
-                                delete_task(row['id'])
+                                delete_task(row['id'], uid)
                                 st.rerun()
 
     with tab2:
