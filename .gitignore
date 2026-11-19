@@ -9,6 +9,9 @@ venv/
 .venv/
 ENV/
 
+# Streamlit Secrets (NUNCA comitar credenciais)
+.streamlit/secrets.toml
+
 # Vercel / Deploy
 .vercel/
 
@@ -17,4 +20,3 @@ ENV/
 .idea/
 .DS_Store
 Thumbs.db
-
