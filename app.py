@@ -193,61 +193,108 @@ hr { border-color: #222228; }
 </style>
 """, unsafe_allow_html=True)
 
-# ─── DATABASE ────────────────────────────────────────────────────────────────
+# ─── DATABASE CONFIGURATION (NUVEM POSTGRESQL + LOCAL SQLITE) ───────────────
+DATABASE_URL = None
+try:
+    if "DATABASE_URL" in st.secrets:
+        DATABASE_URL = st.secrets["DATABASE_URL"]
+except Exception:
+    pass
+
+if not DATABASE_URL:
+    DATABASE_URL = os.environ.get("DATABASE_URL")
+
+IS_POSTGRES = bool(DATABASE_URL)
 DB_PATH = "tasks.db"
 
-def get_conn() -> sqlite3.Connection:
+if IS_POSTGRES:
+    import psycopg2
+
+def get_conn():
+    if IS_POSTGRES:
+        return psycopg2.connect(DATABASE_URL)
     conn = sqlite3.connect(DB_PATH, timeout=10.0)
     conn.execute("PRAGMA journal_mode=WAL;")
     conn.execute("PRAGMA synchronous=NORMAL;")
     return conn
 
+def adapt_sql(sql: str) -> str:
+    """Adapta queries ANSI para o placeholder correto do banco."""
+    if IS_POSTGRES:
+        return sql.replace("?", "%s")
+    return sql
+
 def init_db():
     with get_conn() as conn:
-        conn.execute('''
-            CREATE TABLE IF NOT EXISTS users (
-                id            INTEGER PRIMARY KEY AUTOINCREMENT,
-                username      TEXT    UNIQUE NOT NULL,
-                password_hash TEXT    NOT NULL,
-                created_at    TEXT    DEFAULT (datetime('now'))
-            )
-        ''')
-        conn.execute('''
-            CREATE TABLE IF NOT EXISTS tasks (
-                id        INTEGER PRIMARY KEY AUTOINCREMENT,
-                task_name TEXT    NOT NULL,
-                status    TEXT    NOT NULL DEFAULT 'Pendente',
-                priority  TEXT    NOT NULL DEFAULT 'Média',
-                category  TEXT             DEFAULT '',
-                due_date  TEXT,
-                notes     TEXT             DEFAULT '',
-                created_at TEXT   DEFAULT (datetime('now')),
-                user_id   INTEGER
-            )
-        ''')
-        # Migração para bancos antigos
-        for col, definition in [
-            ("priority",   "TEXT NOT NULL DEFAULT 'Média'"),
-            ("category",   "TEXT DEFAULT ''"),
-            ("notes",      "TEXT DEFAULT ''"),
-            ("created_at", "TEXT DEFAULT (datetime('now'))"),
-            ("user_id",    "INTEGER"),
-        ]:
-            try:
-                conn.execute(f"ALTER TABLE tasks ADD COLUMN {col} {definition}")
-            except Exception:
-                pass
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_tasks_user ON tasks(user_id)")
+        cur = conn.cursor()
+        if IS_POSTGRES:
+            cur.execute('''
+                CREATE TABLE IF NOT EXISTS users (
+                    id            SERIAL PRIMARY KEY,
+                    username      TEXT UNIQUE NOT NULL,
+                    password_hash TEXT NOT NULL,
+                    created_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
+            ''')
+            cur.execute('''
+                CREATE TABLE IF NOT EXISTS tasks (
+                    id         SERIAL PRIMARY KEY,
+                    task_name  TEXT NOT NULL,
+                    status     TEXT NOT NULL DEFAULT 'Pendente',
+                    priority   TEXT NOT NULL DEFAULT 'Média',
+                    category   TEXT DEFAULT '',
+                    due_date   TEXT,
+                    notes      TEXT DEFAULT '',
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    user_id    INTEGER REFERENCES users(id) ON DELETE CASCADE
+                );
+            ''')
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_tasks_user ON tasks(user_id);")
+            conn.commit()
+        else:
+            cur.execute('''
+                CREATE TABLE IF NOT EXISTS users (
+                    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                    username      TEXT    UNIQUE NOT NULL,
+                    password_hash TEXT    NOT NULL,
+                    created_at    TEXT    DEFAULT (datetime('now'))
+                )
+            ''')
+            cur.execute('''
+                CREATE TABLE IF NOT EXISTS tasks (
+                    id        INTEGER PRIMARY KEY AUTOINCREMENT,
+                    task_name TEXT    NOT NULL,
+                    status    TEXT    NOT NULL DEFAULT 'Pendente',
+                    priority  TEXT    NOT NULL DEFAULT 'Média',
+                    category  TEXT             DEFAULT '',
+                    due_date  TEXT,
+                    notes     TEXT             DEFAULT '',
+                    created_at TEXT   DEFAULT (datetime('now')),
+                    user_id   INTEGER
+                )
+            ''')
+            for col, definition in [
+                ("priority",   "TEXT NOT NULL DEFAULT 'Média'"),
+                ("category",   "TEXT DEFAULT ''"),
+                ("notes",      "TEXT DEFAULT ''"),
+                ("created_at", "TEXT DEFAULT (datetime('now'))"),
+                ("user_id",    "INTEGER"),
+            ]:
+                try:
+                    cur.execute(f"ALTER TABLE tasks ADD COLUMN {col} {definition}")
+                except Exception:
+                    pass
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_tasks_user ON tasks(user_id)")
+            conn.commit()
 
 @st.cache_data(ttl=0)
 def get_tasks(user_id: int) -> pd.DataFrame:
+    sql = adapt_sql(
+        "SELECT id, task_name, status, priority, category, due_date, notes, created_at "
+        "FROM tasks WHERE user_id = ? ORDER BY id DESC"
+    )
     with get_conn() as conn:
-        df = pd.read_sql_query(
-            "SELECT id, task_name, status, priority, category, due_date, notes, created_at "
-            "FROM tasks WHERE user_id = ? ORDER BY id DESC",
-            conn,
-            params=(int(user_id),),
-        )
+        df = pd.read_sql_query(sql, conn, params=(int(user_id),))
     return df
 
 # ─── CONSTANTES & SEGURANÇA ──────────────────────────────────────────────────
@@ -296,26 +343,38 @@ def create_user(username: str, password: str) -> int:
         raise ValueError(f"A senha deve ter pelo menos {MIN_PASS_LEN} caracteres.")
 
     with get_conn() as conn:
-        is_first = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0] == 0
+        cur = conn.cursor()
+        cur.execute("SELECT COUNT(*) FROM users")
+        is_first = cur.fetchone()[0] == 0
         try:
-            cur = conn.execute(
-                "INSERT INTO users (username, password_hash) VALUES (?, ?)",
-                (username, hash_password(password)),
-            )
-        except sqlite3.IntegrityError:
+            if IS_POSTGRES:
+                cur.execute(
+                    "INSERT INTO users (username, password_hash) VALUES (%s, %s) RETURNING id",
+                    (username, hash_password(password)),
+                )
+                uid = cur.fetchone()[0]
+            else:
+                cur.execute(
+                    "INSERT INTO users (username, password_hash) VALUES (?, ?)",
+                    (username, hash_password(password)),
+                )
+                uid = cur.lastrowid
+        except Exception:
             raise ValueError("Esse usuário já existe.")
-        uid = cur.lastrowid
+        
         if is_first:
-            # A primeira conta criada herda as tarefas antigas (sem dono)
-            conn.execute("UPDATE tasks SET user_id = ? WHERE user_id IS NULL", (uid,))
+            cur.execute(adapt_sql("UPDATE tasks SET user_id = ? WHERE user_id IS NULL"), (uid,))
+        conn.commit()
     return uid
 
 def authenticate(username: str, password: str):
     with get_conn() as conn:
-        row = conn.execute(
-            "SELECT id, password_hash FROM users WHERE username = ?",
+        cur = conn.cursor()
+        cur.execute(
+            adapt_sql("SELECT id, password_hash FROM users WHERE username = ?"),
             (username.strip().lower(),),
-        ).fetchone()
+        )
+        row = cur.fetchone()
     if row and verify_password(password, row[1]):
         return row[0]
     return None
@@ -328,6 +387,9 @@ def render_auth():
     _, center, _ = st.columns([1, 1.2, 1])
     with center:
         st.markdown("## ⚡ TaskFlow")
+        db_badge = "🌐 Nuvem" if IS_POSTGRES else "💻 Local"
+        st.caption(f"Status do Banco: {db_badge}")
+        
         tab_in, tab_up = st.tabs(["Entrar", "Criar conta"])
 
         with tab_in:
@@ -356,7 +418,7 @@ def render_auth():
                     except ValueError as err:
                         st.error(str(err))
 
-# ─── OPERAÇÕES DE TAREFAS (sempre filtradas pelo dono) ───────────────────────
+# ─── OPERAÇÕES DE TAREFAS (filtradas pelo dono) ───────────────────────────────
 def add_task(user_id: int, name: str, status: str, priority: str, category: str, due_date: str, notes: str):
     if not name or len(name) > MAX_NAME_LEN:
         raise ValueError(f"O nome da tarefa deve ter até {MAX_NAME_LEN} caracteres.")
@@ -366,19 +428,25 @@ def add_task(user_id: int, name: str, status: str, priority: str, category: str,
         raise ValueError(f"Notas não podem exceder {MAX_NOTES_LEN} caracteres.")
 
     with get_conn() as conn:
-        conn.execute(
-            "INSERT INTO tasks (user_id, task_name, status, priority, category, due_date, notes) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        cur = conn.cursor()
+        cur.execute(
+            adapt_sql(
+                "INSERT INTO tasks (user_id, task_name, status, priority, category, due_date, notes) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)"
+            ),
             (int(user_id), name, status, priority, category, due_date, notes)
         )
+        conn.commit()
     get_tasks.clear()
 
 def delete_task(task_id: int, user_id: int):
     with get_conn() as conn:
-        conn.execute(
-            "DELETE FROM tasks WHERE id = ? AND user_id = ?",
+        cur = conn.cursor()
+        cur.execute(
+            adapt_sql("DELETE FROM tasks WHERE id = ? AND user_id = ?"),
             (int(task_id), int(user_id))
         )
+        conn.commit()
     get_tasks.clear()
 
 def update_task(task_id: int, user_id: int, status: str, priority: str, notes: str):
@@ -388,10 +456,12 @@ def update_task(task_id: int, user_id: int, status: str, priority: str, notes: s
         raise ValueError("Notas excedem o tamanho máximo permitido.")
 
     with get_conn() as conn:
-        conn.execute(
-            "UPDATE tasks SET status = ?, priority = ?, notes = ? WHERE id = ? AND user_id = ?",
+        cur = conn.cursor()
+        cur.execute(
+            adapt_sql("UPDATE tasks SET status = ?, priority = ?, notes = ? WHERE id = ? AND user_id = ?"),
             (status, priority, notes, int(task_id), int(user_id))
         )
+        conn.commit()
     get_tasks.clear()
 
 def days_until(due_date_str: str) -> str:
@@ -412,7 +482,8 @@ def days_until(due_date_str: str) -> str:
 def render_sidebar(uid: int):
     with st.sidebar:
         st.markdown("## ⚡ TaskFlow")
-        st.caption(f"👤 {st.session_state.username}")
+        db_badge = "🌐 Nuvem" if IS_POSTGRES else "💻 Local"
+        st.caption(f"👤 {st.session_state.username} · {db_badge}")
         if st.button("🚪 Sair", key="btn_logout"):
             st.session_state.clear()
             st.rerun()
@@ -455,7 +526,7 @@ def render_sidebar(uid: int):
 def main():
     init_db()
 
-    # Sem login → mostra só a tela de autenticação
+    # Sem login → mostra tela de autenticação
     if "user_id" not in st.session_state:
         render_auth()
         return
